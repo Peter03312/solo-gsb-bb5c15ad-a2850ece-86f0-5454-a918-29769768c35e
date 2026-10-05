@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>评员盲评 · 三角嗅辨</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+  <header class="hero">
+    <h1>三角嗅辨盲评</h1>
+    <p>三杯中有两杯是相同样本，请找出不一样的那一杯</p>
+  </header>
+  <div id="app"></div>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+const appEl = document.getElementById('app');
+
+// 支持 /eval/code/<code>、?code=<code> 或手动输入
+let code = (location.pathname.match(/\/eval\/code\/([^/]+)/) || [])[1]
+        || new URLSearchParams(location.search).get('code');
+
+if (!code) {
+  renderEntry();
+} else {
+  loadAssignment();
+}
+
+function renderEntry() {
+  appEl.innerHTML = `
+    <div class="card">
+      <h2>输入盲评码</h2>
+      <form id="codeForm">
+        <label>盲评码（负责人单独发放，仅本人可用一次）</label>
+        <input type="text" id="codeInput" required autocomplete="off"
+               style="text-transform:uppercase;letter-spacing:2px">
+        <button type="submit">进入盲评</button>
+      </form>
+      <p class="small" style="margin-top:16px"><a href="/">返回首页</a></p>
+    </div>`;
+  document.getElementById('codeForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    code = document.getElementById('codeInput').value.trim();
+    history.replaceState(null, '', `/eval/code/${encodeURIComponent(code)}`);
+    loadAssignment();
+  });
+}
+
+async function loadAssignment() {
+  try {
+    const a = await api(`/api/eval/${encodeURIComponent(code)}`);
+    render(a);
+  } catch (err) {
+    appEl.innerHTML = `<div class="card"><div class="callout err">${esc(err.message)}</div>
+      <button class="ghost" onclick="location.href='/eval'">重新输入盲评码</button></div>`;
+  }
+}
+
+let selected = null;
+
+function render(a) {
+  const srvOffset = a.now - Date.now();  // 倒计时以服务端时钟为准
+  const remain = a.deadline - (Date.now() + srvOffset);
+  if (a.submitted) { renderDone(a); return; }
+  if (a.past_deadline) { renderClosed(a); return; }
+
+  appEl.innerHTML = `
+    <div class="card">
+      <h2>评员：${esc(a.panelist)}</h2>
+      <p class="small">截止时间：<b>${fmtTime(a.deadline)}</b>
+        ｜ 剩余 <b id="countdown">${esc(fmtCountdown(remain))}</b></p>
+      <div class="callout warn">
+        规则：三杯（1、2、3）中有两杯来自同一样本，一杯来自另一样本。
+        请嗅辨后点击你认为<b>不一样</b>的那一杯；无法判断可选择弃权。
+        <b>提交后不可修改，且该盲评码只能提交一次。</b>
+      </div>
+      <div class="cups">
+        ${[1, 2, 3].map(n => `<div class="cup" data-pos="${n}">${n} 号杯</div>`).join('')}
+      </div>
+      <div class="choice-row">
+        <button id="submitBtn" disabled>提交选择</button>
+        <button id="abstainBtn" class="ghost">我无法区分（弃权）</button>
+      </div>
+      <div id="msg"></div>
+    </div>`;
+
+  document.querySelectorAll('.cup').forEach((cup) => {
+    cup.addEventListener('click', () => {
+      document.querySelectorAll('.cup').forEach(c => c.classList.remove('selected'));
+      cup.classList.add('selected');
+      selected = parseInt(cup.dataset.pos, 10);
+      document.getElementById('submitBtn').disabled = false;
+    });
+  });
+  document.getElementById('submitBtn').addEventListener('click', () => submit(false));
+  document.getElementById('abstainBtn').addEventListener('click', () => submit(true));
+
+  const timer = setInterval(() => {
+    const el = document.getElementById('countdown');
+    if (!el) { clearInterval(timer); return; }
+    const left = a.deadline - (Date.now() + srvOffset);
+    el.textContent = fmtCountdown(left);
+    if (left <= 0) { clearInterval(timer); loadAssignment(); }
+  }, 500);
+}
+
+async function submit(abstain) {
+  if (!abstain && selected === null) return;
+  if (!abstain && !confirm(`确认异样杯是 ${selected} 号杯？提交后不可修改。`)) return;
+  if (abstain && !confirm('确认弃权？提交后不可修改。')) return;
+
+  const btns = ['submitBtn', 'abstainBtn'];
+  btns.forEach(id => { const b = document.getElementById(id); if (b) b.disabled = true; });
+  const msgEl = document.getElementById('msg');
+  try {
+    await api(`/api/eval/${encodeURIComponent(code)}/submit`, {
+      method: 'POST',
+      body: abstain ? { abstain: true } : { answer: selected },
+    });
+    loadAssignment();
+  } catch (err) {
+    showErr(msgEl, err.message);
+    btns.forEach(id => { const b = document.getElementById(id); if (b) b.disabled = false; });
+    if (/截止|已提交/.test(err.message)) loadAssignment();
+  }
+}
+
+function renderClosed(a) {
+  appEl.innerHTML = `
+    <div class="card">
+      <h2>评员：${esc(a.panelist)}</h2>
+      <div class="callout no">
+        截止时间（${fmtTime(a.deadline)}）已过，答卷通道已关闭，系统不再接收任何提交。
+      </div>
+      ${a.settled ? revealHtml(a) : '<p class="hint">负责人结算后，可在本页回看你的三杯对应关系。</p>'}
+    </div>`;
+}
+
+function renderDone(a) {
+  appEl.innerHTML = `
+    <div class="card">
+      <h2>评员：${esc(a.panelist)}</h2>
+      <div class="callout ok">
+        你的答卷已于 ${fmtTime(a.answered_at)} 提交：
+        <b>${a.abstained ? '弃权' : `选择 ${a.answer} 号杯为异样杯`}</b>。
+        答卷不可修改。
+      </div>
+      ${a.settled ? revealHtml(a) : '<p class="hint">结果尚未结算；结算后可在本页回看三杯对应关系。</p>'}
+    </div>`;
+}
+
+function revealHtml(a) {
+  const correct = a.abstained ? null : (a.answer === a.odd_pos);
+  return `
+    <h2 style="margin-top:20px">结算回看</h2>
+    <table>
+      <tr><th>异样杯位置</th><td>${a.odd_pos} 号杯</td></tr>
+      <tr><th>异样杯样本</th><td>样本 ${esc(a.odd_sample)}
+        （A=${esc(a.sample_a)}，B=${esc(a.sample_b)}）</td></tr>
+      <tr><th>你的判定</th><td>
+        ${a.abstained ? '弃权' : correct
+          ? '<span class="badge ok">答对</span>'
+          : '<span class="badge no">答错</span>'}</td></tr>
+    </table>`;
+}
+</script>
+</body>
+</html>

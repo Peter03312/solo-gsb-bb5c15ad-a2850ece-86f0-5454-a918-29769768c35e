@@ -1,0 +1,17 @@
+services:
+  sniff-bench:
+    build: .
+    image: triangle-sniff-bench:1.0
+    container_name: triangle-sniff-bench
+    ports:
+      # 宿主机端口可用环境变量 HOST_PORT 覆盖，默认 8080
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      # SQLite 数据持久化到宿主机，容器重建后测试与答卷不丢失
+      - sniff-data:/data
+    environment:
+      SNIFF_DB_PATH: /data/sniff.db
+    restart: unless-stopped
+
+volumes:
+  sniff-data:

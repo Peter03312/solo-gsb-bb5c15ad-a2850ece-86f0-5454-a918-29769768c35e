@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>负责人结算台 · 三角嗅辨盲评</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+  <header class="hero">
+    <h1>负责人结算台</h1>
+    <p><a href="/">← 返回首页</a></p>
+  </header>
+
+  <div id="app"></div>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+const appEl = document.getElementById('app');
+const params = new URLSearchParams(location.search);
+const code = params.get('test');
+const token = params.get('token');
+let timer = null;
+
+if (!code || !token) {
+  appEl.innerHTML = `<div class="card"><div class="callout err">
+    缺少测试码或令牌。请从<a href="/">首页</a>创建或重新打开。</div></div>`;
+} else {
+  load();
+}
+
+async function load() {
+  try {
+    const t = await api(`/api/tests/${encodeURIComponent(code)}?token=${encodeURIComponent(token)}`);
+    render(t);
+  } catch (err) {
+    appEl.innerHTML = `<div class="card"><div class="callout err">${esc(err.message)}</div>
+      <p class="small"><a href="/">返回首页</a></p></div>`;
+  }
+}
+
+function render(t) {
+  const srvOffset = t.now - Date.now();  // 倒计时以服务端时钟为准
+  const remain = t.deadline - (Date.now() + srvOffset);
+  const past = remain <= 0;
+  appEl.innerHTML = `
+    <div class="card">
+      <h2>测试 <span class="mono">${esc(t.test_code)}</span></h2>
+      <p class="small">样本 A：<b>${esc(t.sample_a)}</b> ｜ 样本 B：<b>${esc(t.sample_b)}</b></p>
+      <p class="small">截止时间：<b>${fmtTime(t.deadline)}</b>
+        ｜ 最少有效答卷：<b>${t.min_valid}</b> 份</p>
+      <p class="small">距截止：<b id="countdown" style="font-size:16px">${esc(fmtCountdown(remain))}</b></p>
+      <div class="stat-grid">
+        <div class="stat"><div class="num">${t.progress.total}</div><div class="cap">评员总数</div></div>
+        <div class="stat"><div class="num">${t.progress.submitted}</div><div class="cap">已提交(含弃权)</div></div>
+        <div class="stat"><div class="num">${t.progress.valid}</div><div class="cap">有效答卷</div></div>
+      </div>
+      <p class="hint">截止前仅显示汇总计数，不显示任何评员的答案与三杯对应关系，以防泄露。</p>
+      <button id="settleBtn" ${(!past || t.settled) ? 'disabled' : ''}>
+        ${t.settled ? '已结算（结果已冻结）' : past ? '立即结算' : '截止后才能结算'}
+      </button>
+      <div id="settleMsg"></div>
+      <div id="report"></div>
+    </div>
+
+    <div class="card">
+      <h2>盲评码分发名单（仅负责人可见）</h2>
+      <p class="hint">请将每人的专属链接单独发给本人；盲评码不可重复使用。</p>
+      <table>
+        <thead><tr><th>评员</th><th>盲评码 / 专属链接</th></tr></thead>
+        <tbody>
+          ${t.codes.map(c => `
+            <tr>
+              <td>${esc(c.panelist)}</td>
+              <td class="code">${esc(c.code)}
+                <a href="${esc(c.url)}" target="_blank" class="small">打开</a></td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+
+  clearInterval(timer);
+  timer = setInterval(() => {
+    const el = document.getElementById('countdown');
+    if (el) el.textContent = fmtCountdown(t.deadline - (Date.now() + srvOffset));
+    const btn = document.getElementById('settleBtn');
+    if (btn && !t.settled && t.deadline - (Date.now() + srvOffset) <= 0 && btn.disabled) {
+      btn.disabled = false;
+      btn.textContent = '立即结算';
+    }
+  }, 1000);
+
+  document.getElementById('settleBtn').addEventListener('click', doSettle);
+  if (t.settled) doSettle();
+}
+
+async function doSettle() {
+  const btn = document.getElementById('settleBtn');
+  const msgEl = document.getElementById('settleMsg');
+  if (btn) { btn.disabled = true; btn.textContent = '结算中…'; }
+  try {
+    const r = await api(`/api/tests/${encodeURIComponent(code)}/settle`, {
+      method: 'POST', body: { token },
+    });
+    renderReport(r);
+    if (btn) { btn.disabled = true; btn.textContent = '已结算（结果已冻结）'; }
+  } catch (err) {
+    showErr(msgEl, err.message);
+    if (btn) { btn.disabled = false; btn.textContent = '立即结算'; }
+  }
+}
+
+function renderReport(r) {
+  const el = document.getElementById('report');
+  const kind = r.distinguishable ? 'ok' : 'no';
+  const label = r.distinguishable
+    ? '<span class="badge ok">判为可辨</span>'
+    : '<span class="badge no">不可判为可辨</span>';
+  el.innerHTML = `
+    <h2 style="margin-top:24px">结算结果 ${label}</h2>
+    <div class="callout ${kind === 'ok' ? 'ok' : 'warn'}">${esc(r.conclusion)}</div>
+    <div class="stat-grid">
+      <div class="stat"><div class="num">${r.valid_count}</div><div class="cap">有效答卷</div></div>
+      <div class="stat"><div class="num">${r.correct_count}</div><div class="cap">答对</div></div>
+      <div class="stat"><div class="num">${r.abstained_count}</div><div class="cap">弃权</div></div>
+      <div class="stat"><div class="num">${r.missing_count}</div><div class="cap">未交</div></div>
+      <div class="stat"><div class="num">${r.p_value === null ? '—' : r.p_value.toFixed(4)}</div>
+        <div class="cap">单侧尾概率 (p=1/3)</div></div>
+    </div>
+    <p class="hint">判定规则：有效答卷 ≥ ${r.min_valid} 且
+      P(X≥答对 | X~Binomial(n,1/3)) ≤ 0.05 才判为可辨。</p>
+
+    <h2>分配与答卷回看（冻结）</h2>
+    <table>
+      <thead><tr>
+        <th>评员</th><th>盲评码</th><th>异样杯位置</th><th>异样杯样本</th>
+        <th>提交答案</th><th>判定</th>
+      </tr></thead>
+      <tbody>
+        ${r.assignments.map(a => `
+          <tr class="${a.correct === true ? 'hit' : a.correct === false ? 'miss' : ''}">
+            <td>${esc(a.panelist)}</td>
+            <td class="code">${esc(a.code)}</td>
+            <td>${a.odd_pos} 号杯</td>
+            <td>样本 ${esc(a.odd_sample)}</td>
+            <td>${a.answer === null ? '<span class="badge wait">未交</span>'
+                : a.answer === '弃权' ? '<span class="badge wait">弃权</span>'
+                : `${a.answer} 号杯`}</td>
+            <td>${a.correct === null ? '—'
+                : a.correct ? '<span class="badge ok">答对</span>'
+                : '<span class="badge no">答错</span>'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+</script>
+</body>
+</html>

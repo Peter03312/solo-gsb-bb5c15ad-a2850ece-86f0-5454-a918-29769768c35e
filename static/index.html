@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>三角嗅辨盲评工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+  <header class="hero">
+    <h1>三角嗅辨盲评工作台</h1>
+    <p>三杯法（Triangle Test）· 比较两种气味样本是否可辨</p>
+  </header>
+
+  <div class="card">
+    <h2>① 负责人创建盲评</h2>
+    <form id="createForm">
+      <div class="row">
+        <div>
+          <label>样本 A 编号</label>
+          <input type="text" id="sampleA" required maxlength="64" placeholder="如 S-101">
+        </div>
+        <div>
+          <label>样本 B 编号</label>
+          <input type="text" id="sampleB" required maxlength="64" placeholder="如 S-102">
+        </div>
+      </div>
+
+      <label>评员名单（每行一个姓名，自动去重、去空行，最多 500 人）</label>
+      <textarea id="panelists" required placeholder="张三&#10;李四&#10;王五"></textarea>
+
+      <div class="row">
+        <div>
+          <label>截止时间（按本机时区选择）</label>
+          <input type="datetime-local" id="deadline" required>
+        </div>
+        <div>
+          <label>最少有效答卷数</label>
+          <input type="number" id="minValid" required min="1" value="6">
+        </div>
+      </div>
+
+      <p class="hint">系统将为每位评员生成仅本人可用的盲评码，三杯随机顺序、异样杯位置在全体中均衡分配。</p>
+      <button type="submit">创建盲评</button>
+    </form>
+    <div id="createMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>② 进入已有工作台</h2>
+    <form id="openForm" class="row" style="align-items:flex-end">
+      <div>
+        <label>测试码</label>
+        <input type="text" id="openCode" required placeholder="管理用测试码">
+      </div>
+      <div>
+        <label>负责人令牌</label>
+        <input type="text" id="openToken" required placeholder="创建时发放，仅显示一次">
+      </div>
+      <div style="flex:0">
+        <button type="submit" class="ghost">打开结算台</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>评员入口</h2>
+    <p class="small">收到负责人分发的专属链接或盲评码后，<a href="/eval">点此进入盲评</a>。</p>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+const msg = document.getElementById('createMsg');
+
+document.getElementById('createForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  msg.innerHTML = '';
+  const names = document.getElementById('panelists').value.split('\n')
+    .map(s => s.trim()).filter(Boolean);
+  const dl = document.getElementById('deadline').value;
+  if (!dl) return showErr(msg, '请选择截止时间');
+  const deadline = new Date(dl).getTime();
+  if (deadline <= Date.now()) return showErr(msg, '截止时间必须晚于当前时间');
+
+  try {
+    const r = await api('/api/tests', {
+      method: 'POST',
+      body: {
+        sample_a: document.getElementById('sampleA').value,
+        sample_b: document.getElementById('sampleB').value,
+        panelists: names,
+        deadline,
+        min_valid: parseInt(document.getElementById('minValid').value, 10),
+      },
+    });
+    saveTest(r.test_code, r.token);
+    location.href = r.dashboard;
+  } catch (err) {
+    showErr(msg, err.message);
+  }
+});
+
+document.getElementById('openForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const code = document.getElementById('openCode').value.trim();
+  const token = document.getElementById('openToken').value.trim();
+  location.href = `/admin?test=${encodeURIComponent(code)}&token=${encodeURIComponent(token)}`;
+});
+</script>
+</body>
+</html>
