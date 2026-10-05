@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -267,6 +268,276 @@ try:
     check("零有效答卷判为样本不足而非证据未达阈值",
           rep4["distinguishable"] is False and "样本不足" in rep4["conclusion"],
           rep4["conclusion"])
+
+    # --- 2.7 名单调整：撤回 / 补位（复用 9 人均衡测试 bal，截止尚远、无人提交） ---
+    # 先记录调整前分配（已有评员的杯序/异样样本必须保持不变）
+    before = con.execute(
+        "SELECT panelist, odd_pos, odd_sample FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY panelist",
+        (bal["test_code"],)).fetchall()
+    before_map = {r["panelist"]: (r["odd_pos"], r["odd_sample"]) for r in before}
+
+    # 只补位：+1 人，补到当前计数最缺的位置与样本
+    s, add1 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
+                  {"token": bal["token"], "add_panelists": ["P9"]})
+    check("只补位 1 人 200", s == 200, str(add1))
+    check("补位返回新专属码",
+          len(add1["added"]) == 1 and add1["added"][0]["panelist"] == "P9"
+          and add1["added"][0]["code"] and add1["added"][0]["url"])
+    check("补位后有效名单=10", add1["progress"]["total"] == 10)
+
+    # 一次操作撤回 3 人并补位 2 人：10-3+2=9，位置计数应恢复 3/3/3
+    withdraw3 = [codes[6], codes[7], codes[8]]
+    s, adj = req("POST", f"/api/tests/{bal['test_code']}/adjust", {
+        "token": bal["token"],
+        "withdraw_codes": withdraw3,
+        "add_panelists": ["R1", "R2"]})
+    check("撤回3补位2 一次操作 200", s == 200, str(adj))
+    check("撤回名单含 3 人", len(adj["withdrawn"]) == 3)
+    check("补位名单含 2 人",
+          [a["panelist"] for a in adj["added"]] == ["R1", "R2"])
+    check("调整后有效名单=9", adj["progress"]["total"] == 9)
+
+    after = con.execute(
+        "SELECT * FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) AND status='active'",
+        (bal["test_code"],)).fetchall()
+    pc = {p: sum(1 for r in after if r["odd_pos"] == p) for p in (1, 2, 3)}
+    sc = {x: sum(1 for r in after if r["odd_sample"] == x) for x in ("A", "B")}
+    check("撤回+补位后异样杯位置仍均衡 3/3/3", list(pc.values()) == [3, 3, 3],
+          str(pc))
+    check("撤回+补位后异样样本仍均衡 (4/5 或 5/4)",
+          sorted(sc.values()) == [4, 5], str(sc))
+    check("已有评员的杯序/异样样本不变",
+          all(before_map[r["panelist"]] == (r["odd_pos"], r["odd_sample"])
+              for r in after if r["panelist"] in before_map))
+    check("补位者取得全新唯一码",
+          all(r["code"] not in codes for r in after if r["panelist"] in ("R1", "R2")))
+
+    # 撤回后的旧码立即无法查看或提交
+    st, _ = req("GET", f"/api/eval/{codes[6]}")
+    check("已撤回旧码查看 → 404", st == 404)
+    st, _ = req("POST", f"/api/eval/{codes[6]}/submit", {"answer": 1})
+    check("已撤回旧码提交 → 404", st == 404)
+
+    # 进度接口只统计有效名单，并给出 withdrawn_count
+    s, admin2 = req("GET", f"/api/tests/{bal['test_code']}?token={bal['token']}")
+    check("进度接口有效名单=9、已撤回=3",
+          s == 200 and admin2["progress"]["total"] == 9
+          and admin2["withdrawn_count"] == 3, str(admin2.get("progress")))
+    check("分发名单不含已撤回者",
+          sorted(c["panelist"] for c in admin2["codes"]
+                 if c["panelist"] in (f"P{i}" for i in (6, 7, 8))) == [])
+
+    # 已作答 / 已弃权者不可撤回：单独建一个 3 人测试
+    s, aw = req("POST", "/api/tests", {
+        "sample_a": "W-1", "sample_b": "W-2",
+        "panelists": ["w1", "w2", "w3"],
+        "deadline": t["now"] + 3600_000, "min_valid": 1})
+    assert s == 200
+    aw_rows = con.execute(
+        "SELECT * FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?)", (aw["test_code"],)).fetchall()
+    req("POST", f"/api/eval/{aw_rows[0]['code']}/submit", {"answer": 1})
+    req("POST", f"/api/eval/{aw_rows[1]['code']}/submit", {"abstain": True})
+    st, b1 = req("POST", f"/api/tests/{aw['test_code']}/adjust", {
+        "token": aw["token"], "withdraw_codes": [aw_rows[0]["code"]]})
+    check("已作答者不可撤回 (409)", st == 409 and "已作答" in b1["detail"],
+          str(b1))
+    st, b2 = req("POST", f"/api/tests/{aw['test_code']}/adjust", {
+        "token": aw["token"], "withdraw_codes": [aw_rows[1]["code"]]})
+    check("已弃权者不可撤回 (409)", st == 409 and "已弃权" in b2["detail"],
+          str(b2))
+
+    # 姓名不得重用（与有效名单、已撤回者都冲突）
+    st, b3 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
+                 {"token": bal["token"], "add_panelists": ["R1"]})
+    check("与有效名单重名被拒 (422)", st == 422 and "重用" in b3["detail"])
+    st, b4 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
+                 {"token": bal["token"], "add_panelists": ["P7"]})
+    check("与已撤回者重名被拒 (422)", st == 422 and "重用" in b4["detail"])
+    st, b5 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
+                 {"token": bal["token"],
+                  "add_panelists": ["dup", "dup"]})
+    check("补位名单内部重名被拒 (422)", st == 422)
+    st, b6 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
+                 {"token": bal["token"],
+                  "withdraw_codes": [codes[0], codes[0]]})
+    check("撤回名单内部重复被拒 (422)", st == 422)
+    st, b7 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
+                 {"token": bal["token"]})
+    check("空操作被拒 (422)", st == 422)
+    st, b8 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
+                 {"token": bal["token"], "withdraw_codes": ["NOPE-NOPE"]})
+    check("撤回无效盲评码 → 404", st == 404)
+    st, b9 = req("POST", f"/api/tests/{bal['test_code']}/adjust",
+                 {"token": "wrong", "add_panelists": ["x"]})
+    check("调整接口错误令牌 403", st == 403)
+
+    # 下限：新建 min_valid=4 的 4 人测试，撤回 1 人 → 3 < 4，整次操作无效
+    s, mn = req("POST", "/api/tests", {
+        "sample_a": "M-1", "sample_b": "M-2",
+        "panelists": ["m1", "m2", "m3", "m4"],
+        "deadline": t["now"] + 3600_000, "min_valid": 4})
+    assert s == 200
+    mn_rows = con.execute(
+        "SELECT code FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+        (mn["test_code"],)).fetchall()
+    st, low = req("POST", f"/api/tests/{mn['test_code']}/adjust", {
+        "token": mn["token"], "withdraw_codes": [mn_rows[0]["code"]]})
+    check("低于最少有效人数整次拒绝 (422)",
+          st == 422 and "低于" in low["detail"], str(low))
+    mn_left = con.execute(
+        "SELECT COUNT(*) AS c FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) AND status='active'",
+        (mn["test_code"],)).fetchone()["c"]
+    check("拒绝后名单不变（仍 4 人有效 / 0 撤回）", mn_left == 4, str(mn_left))
+    st, _ = req("GET", f"/api/eval/{mn_rows[0]['code']}")
+    check("被回滚的撤回码仍可正常查看", st == 200)
+    # 撤回并同数补位使人数不变 → 允许
+    st, keep = req("POST", f"/api/tests/{mn['test_code']}/adjust", {
+        "token": mn["token"],
+        "withdraw_codes": [mn_rows[0]["code"]],
+        "add_panelists": ["m5"]})
+    check("撤回1补位1 人数仍=4 允许",
+          st == 200 and keep["progress"]["total"] == 4, str(st))
+
+    # 上限：新建 2 人测试（min_valid=1），直接补到 500 允许，再补 1 人拒绝
+    s, cap = req("POST", "/api/tests", {
+        "sample_a": "C-1", "sample_b": "C-2",
+        "panelists": ["c1", "c2"],
+        "deadline": t["now"] + 3600_000, "min_valid": 1})
+    assert s == 200
+    st, cap498 = req("POST", f"/api/tests/{cap['test_code']}/adjust",
+                     {"token": cap["token"],
+                      "add_panelists": [f"N{i}" for i in range(498)]})
+    check("补位至 500 人允许 (200)",
+          st == 200 and cap498["progress"]["total"] == 500, str(st))
+    st, cap501 = req("POST", f"/api/tests/{cap['test_code']}/adjust",
+                     {"token": cap["token"], "add_panelists": ["N498"]})
+    check("补位超过 500 人拒绝 (422)", st == 422 and "上限" in cap501["detail"],
+          str(cap501))
+    cap_rows = con.execute(
+        "SELECT odd_pos FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) AND status='active'",
+        (cap["test_code"],)).fetchall()
+    cap_pc = {p: sum(1 for r in cap_rows if r["odd_pos"] == p)
+              for p in (1, 2, 3)}
+    check("补位到 500 人位置计数极差 ≤ 1",
+          max(cap_pc.values()) - min(cap_pc.values()) <= 1, str(cap_pc))
+
+    # 截止后 / 结算后拒绝调整（复用已结算的 t2）
+    st, da = req("POST", f"/api/tests/{t2['test_code']}/adjust",
+                 {"token": t2["token"], "add_panelists": ["late"]})
+    check("已结算测试调整被拒 (409)", st == 409)
+
+    # 截止（未结算）同样拒绝：建 1 人短截止测试并等过截止
+    s, dl = req("POST", "/api/tests", {
+        "sample_a": "D-1", "sample_b": "D-2",
+        "panelists": ["d1"],
+        "deadline": int(time.time() * 1000) + 1500, "min_valid": 1})
+    assert s == 200
+    time.sleep(2.0)
+    st, dle = req("POST", f"/api/tests/{dl['test_code']}/adjust",
+                  {"token": dl["token"], "add_panelists": ["d2"]})
+    check("截止后未结算也拒绝调整 (409)", st == 409 and "截止" in dle["detail"],
+          str(dle))
+
+    # 结算只统计有效名单：新建 4 人，1 答对 1 弃权 1 未交 1 撤回
+    s, ex = req("POST", "/api/tests", {
+        "sample_a": "E-1", "sample_b": "E-2",
+        "panelists": ["e1", "e2", "e3", "e4"],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    ex_rows = con.execute(
+        "SELECT * FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+        (ex["test_code"],)).fetchall()
+    req("POST", f"/api/eval/{ex_rows[0]['code']}/submit",
+        {"answer": ex_rows[0]["odd_pos"]})      # 答对
+    req("POST", f"/api/eval/{ex_rows[1]['code']}/submit", {"abstain": True})
+    # e3 未交；e4 未交且在截止前被撤回
+    st, _ = req("POST", f"/api/tests/{ex['test_code']}/adjust", {
+        "token": ex["token"],
+        "withdraw_codes": [ex_rows[3]["code"]],
+        "add_panelists": ["e5"]})                 # e5 补位后也未交
+    assert st == 200
+    # 直接在库里把截止时间改到过去以便立即结算
+    con.execute("UPDATE tests SET deadline=? WHERE code=?",
+                (int(time.time()) - 10, ex["test_code"]))
+    con.commit()
+    s, exr = req("POST", f"/api/tests/{ex['test_code']}/settle",
+                 {"token": ex["token"]})
+    check("结算排除已撤回：有效名单 4 人",
+          exr["valid_count"] == 1 and exr["abstained_count"] == 1
+          and exr["missing_count"] == 2, str((exr["valid_count"],
+                                              exr["abstained_count"],
+                                              exr["missing_count"])))
+    check("结算回看不含已撤回评员 e4",
+          all(a["panelist"] != "e4" for a in exr["assignments"])
+          and {a["panelist"] for a in exr["assignments"]}
+              == {"e1", "e2", "e3", "e5"})
+
+    # --- 2.8 并发：同一评员码上「撤回」与「答卷」竞争，按实际先完成者判定 ---
+    now_s, _ = req("GET", "/api/time")
+    s, ct = req("POST", "/api/tests", {
+        "sample_a": "F-1", "sample_b": "F-2",
+        "panelists": [f"c{i}" for i in range(40)],
+        "deadline": int(time.time() * 1000) + 3600_000, "min_valid": 1})
+    assert s == 200
+    ct_rows = con.execute(
+        "SELECT code FROM assignments WHERE test_id="
+        "(SELECT id FROM tests WHERE code=?) ORDER BY id",
+        (ct["test_code"],)).fetchall()
+
+    def race_round(c):
+        result = {}
+        barrier = threading.Barrier(2)
+
+        def do_submit():
+            barrier.wait()
+            stt, _ = req("POST", f"/api/eval/{c}/submit", {"answer": 1})
+            result["submit"] = stt
+
+        def do_withdraw():
+            barrier.wait()
+            stt, _ = req("POST", f"/api/tests/{ct['test_code']}/adjust",
+                         {"token": ct["token"], "withdraw_codes": [c]})
+            result["withdraw"] = stt
+
+        t1 = threading.Thread(target=do_submit)
+        t2 = threading.Thread(target=do_withdraw)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        return result
+
+    n_submit_win = n_withdraw_win = 0
+    race_ok = no_5xx = True
+    for i in range(20):  # 20 个不同的码；最坏全撤回也仍有 20 名有效评员
+        c = ct_rows[i]["code"]
+        r = race_round(c)
+        row = con.execute(
+            "SELECT status, answer FROM assignments WHERE code=?", (c,)
+        ).fetchone()
+        # 答卷先完成：submit=200、withdraw=409（已作答不可撤回），active 且有答卷
+        if r["submit"] == 200 and r["withdraw"] == 409:
+            if not (row["status"] == "active" and row["answer"] == 1):
+                race_ok = False
+            n_submit_win += 1
+        # 撤回先完成：withdraw=200、submit=404（旧码立即失效），withdrawn 且无答卷
+        elif r["withdraw"] == 200 and r["submit"] == 404:
+            if not (row["status"] == "withdrawn" and row["answer"] is None):
+                race_ok = False
+            n_withdraw_win += 1
+        else:
+            race_ok = False  # 不允许双赢 / 双输 / 其他状态
+        if r["submit"] >= 500 or r["withdraw"] >= 500:
+            no_5xx = False
+
+    check("并发：撤回与答卷结果互补、数据库状态与胜出方一致，无脏中间态",
+          race_ok and n_submit_win + n_withdraw_win == 20,
+          f"答卷先完成 {n_submit_win} 轮，撤回先完成 {n_withdraw_win} 轮")
+    check("并发过程中无 5xx 服务端错误", no_5xx)
 
     # --- 2.6 页面可达性 ---
     for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}"):

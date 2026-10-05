@@ -26,6 +26,9 @@ from .stats import binomial_tail
 
 STATIC_DIR = "static"
 ABSTAIN = -1
+ACTIVE = "active"
+WITHDRAWN = "withdrawn"
+MAX_PANELISTS = 500
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +91,21 @@ def assign_cups(n: int):
     return result
 
 
+def pick_balanced(c_pos: dict, c_sample: dict):
+    """在当前有效名单计数上选 (odd_pos, odd_sample)，使位置与样本计数尽量均衡。
+
+    两维独立贪心：始终挑当前计数最少的那一档；同档随机打破平局。
+    逐人插入后，各位置计数极差 ≤ 1、异样样本 A/B 计数极差 ≤ 1。
+    """
+    pos = min((1, 2, 3), key=lambda p: (c_pos[p], secrets.randbelow(3)))
+    sample = min(
+        ("A", "B"), key=lambda s: (c_sample[s], secrets.randbelow(2))
+    )
+    c_pos[pos] += 1
+    c_sample[sample] += 1
+    return pos, sample
+
+
 def assignment_public(a) -> dict:
     """评员可见：截止/结算前绝不暴露异样杯对应关系。"""
     return {
@@ -137,6 +155,17 @@ class SubmitAnswer(BaseModel):
     abstain: bool = False
 
 
+class AdjustRoster(BaseModel):
+    """负责人截止前处理缺席：撤回未交盲评码、补位新评员，可单用或合用。"""
+    token: str
+    withdraw_codes: List[str] = Field(
+        default_factory=list, description="要撤回的盲评码，仅未提交者可撤回"
+    )
+    add_panelists: List[str] = Field(
+        default_factory=list, description="补位评员姓名，同一实验姓名不得重用"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
@@ -147,7 +176,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.0", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.1", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -179,8 +208,8 @@ def create_test(body: TestCreate):
             names.append(name)
     if not names:
         raise HTTPException(status_code=422, detail="评员名单不能为空")
-    if len(names) > 500:
-        raise HTTPException(status_code=422, detail="评员人数不得超过 500")
+    if len(names) > MAX_PANELISTS:
+        raise HTTPException(status_code=422, detail=f"评员人数不得超过 {MAX_PANELISTS}")
 
     deadline = body.deadline // 1000  # 毫秒 -> 秒
     if deadline <= now_ts():
@@ -223,9 +252,14 @@ def get_test(test_code: str, token: str):
     try:
         assigns = conn.execute(
             "SELECT panelist, code, answer, answered_at FROM assignments "
-            "WHERE test_id = ? ORDER BY id",
-            (row["id"],),
+            "WHERE test_id = ? AND status = ? ORDER BY id",
+            (row["id"], ACTIVE),
         ).fetchall()
+        withdrawn = conn.execute(
+            "SELECT COUNT(*) AS c FROM assignments "
+            "WHERE test_id = ? AND status = ?",
+            (row["id"], WITHDRAWN),
+        ).fetchone()["c"]
     finally:
         conn.close()
 
@@ -242,6 +276,7 @@ def get_test(test_code: str, token: str):
         "now": ts * 1000,
         "min_valid": row["min_valid"],
         "settled": row["settled_at"] is not None,
+        "withdrawn_count": withdrawn,
         "panelists": [a["panelist"] for a in assigns],
         "codes": [  # 仅负责人可见，用于向评员分发专属盲评链接
             {"panelist": a["panelist"],
@@ -265,8 +300,8 @@ def get_assignment(code: str):
         a = conn.execute(
             "SELECT a.*, t.deadline, t.settled_at, t.sample_a, t.sample_b "
             "FROM assignments a JOIN tests t ON a.test_id = t.id "
-            "WHERE a.code = ?",
-            (code,),
+            "WHERE a.code = ? AND a.status = ?",
+            (code, ACTIVE),
         ).fetchone()
     finally:
         conn.close()
@@ -307,8 +342,9 @@ def submit(code: str, body: SubmitAnswer):
     with db.write_tx() as conn:
         a = conn.execute(
             "SELECT a.*, t.deadline FROM assignments a "
-            "JOIN tests t ON a.test_id = t.id WHERE a.code = ?",
-            (code,),
+            "JOIN tests t ON a.test_id = t.id "
+            "WHERE a.code = ? AND a.status = ?",
+            (code, ACTIVE),
         ).fetchone()
         if a is None:
             raise HTTPException(status_code=404, detail="盲评码无效")
@@ -344,7 +380,8 @@ def settle(test_code: str, body: AdminAction):
             frozen = row
         else:
             assigns = conn.execute(
-                "SELECT * FROM assignments WHERE test_id = ?", (row["id"],)
+                "SELECT * FROM assignments WHERE test_id = ? AND status = ?",
+                (row["id"], ACTIVE),
             ).fetchall()
             valid = sum(1 for a in assigns if a["answer"] not in (None, ABSTAIN))
             correct = sum(
@@ -363,7 +400,9 @@ def settle(test_code: str, body: AdminAction):
             ).fetchone()
 
         assigns = conn.execute(
-            "SELECT * FROM assignments WHERE test_id = ? ORDER BY id", (row["id"],)
+            "SELECT * FROM assignments WHERE test_id = ? AND status = ? "
+            "ORDER BY id",
+            (row["id"], ACTIVE),
         ).fetchall()
 
     if frozen["valid_count"] < frozen["min_valid"]:
@@ -398,6 +437,178 @@ def settle(test_code: str, body: AdminAction):
         "distinguishable": bool(frozen["distinguishable"]),
         "conclusion": conclusion,
         "assignments": [assignment_detail(a) for a in assigns],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 名单调整（撤回 / 补位）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/tests/{test_code}/adjust")
+def adjust_roster(test_code: str, body: AdjustRoster):
+    """截止前处理评员缺席：可只补位、只撤回，或一次操作撤回并补位。
+
+    - 仅未提交（answer IS NULL）者可撤回；已作答或已弃权不可撤回。
+    - 撤回后旧码立即无法查看或提交（标记 withdrawn，评员接口按无效码处理）。
+    - 补位取得新专属码；同一实验姓名（含已撤回者）不得重用。
+    - 已有评员的杯序、异样样本和答卷不变；新分配在当前有效名单上贪心均衡。
+    - 调整后有效人数须满足 min_valid ≤ 人数 ≤ 500。
+    - 截止或结算后拒绝；任一校验失败整个操作回滚。
+    - 与答卷并发时，以实际先拿到写锁并完成的操作为准。
+    """
+    withdraw_codes = [c.strip() for c in body.withdraw_codes if c and c.strip()]
+    if len(withdraw_codes) != len(set(withdraw_codes)):
+        raise HTTPException(status_code=422, detail="撤回名单中盲评码重复")
+
+    names, seen_names = [], set()
+    for raw in body.add_panelists:
+        name = (raw or "").strip()
+        if not name:
+            continue
+        if name in seen_names:
+            raise HTTPException(status_code=422, detail=f"补位名单中姓名重复：{name}")
+        seen_names.add(name)
+        names.append(name)
+
+    if not withdraw_codes and not names:
+        raise HTTPException(status_code=422,
+                            detail="未提供要撤回的盲评码或补位评员姓名")
+
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        if row["settled_at"] is not None:
+            raise HTTPException(status_code=409,
+                                detail="测试已结算，名单已冻结，不能调整")
+        if now_ts() >= row["deadline"]:
+            raise HTTPException(status_code=409,
+                                detail="已过截止时间，不能调整名单")
+
+        # ---- 撤回校验：码属于本实验有效名单，且尚未提交 ----
+        withdrawn_rows = []
+        for code in withdraw_codes:
+            a = conn.execute(
+                "SELECT * FROM assignments WHERE test_id = ? AND code = ?",
+                (row["id"], code),
+            ).fetchone()
+            if a is None:
+                raise HTTPException(status_code=404, detail=f"盲评码无效：{code}")
+            if a["status"] == WITHDRAWN:
+                raise HTTPException(
+                    status_code=409, detail=f"盲评码 {code} 已撤回，不能重复撤回"
+                )
+            if a["answer"] is not None:
+                kind = "已弃权" if a["answer"] == ABSTAIN else "已作答"
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"评员「{a['panelist']}」{kind}，不可撤回（盲评码 {code}）",
+                )
+            withdrawn_rows.append(a)
+
+        # ---- 补位校验：同一实验姓名（含已撤回者）不得重用 ----
+        if names:
+            placeholders = ",".join("?" for _ in names)
+            dup_rows = conn.execute(
+                f"SELECT panelist FROM assignments WHERE test_id = ? "
+                f"AND panelist IN ({placeholders})",
+                (row["id"], *names),
+            ).fetchall()
+            if dup_rows:
+                dup = "、".join(r["panelist"] for r in dup_rows)
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"姓名在本实验中已存在（含已撤回者），不得重用：{dup}",
+                )
+
+        # ---- 调整后有效人数上下限 ----
+        active_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM assignments "
+            "WHERE test_id = ? AND status = ?",
+            (row["id"], ACTIVE),
+        ).fetchone()["c"]
+        after = active_count - len(withdrawn_rows) + len(names)
+        if after < row["min_valid"]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"调整后有效人数 {after} 人，低于最少有效答卷数 "
+                       f"{row['min_valid']}，整次操作无效",
+            )
+        if after > MAX_PANELISTS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"调整后有效人数 {after} 人，超过上限 {MAX_PANELISTS} 人，"
+                       "整次操作无效",
+            )
+
+        # ---- 执行撤回（旧码保留审计痕迹但立即失效） ----
+        for a in withdrawn_rows:
+            conn.execute(
+                "UPDATE assignments SET status = ? WHERE id = ?",
+                (WITHDRAWN, a["id"]),
+            )
+
+        # ---- 执行补位：在当前有效名单上逐人贪心均衡 ----
+        added = []
+        if names:
+            c_pos = {1: 0, 2: 0, 3: 0}
+            c_sample = {"A": 0, "B": 0}
+            for r in conn.execute(
+                "SELECT odd_pos, odd_sample, COUNT(*) AS c FROM assignments "
+                "WHERE test_id = ? AND status = ? GROUP BY odd_pos, odd_sample",
+                (row["id"], ACTIVE),
+            ):
+                c_pos[r["odd_pos"]] += r["c"]
+                c_sample[r["odd_sample"]] += r["c"]
+
+            for name in names:
+                odd_pos, odd_sample = pick_balanced(c_pos, c_sample)
+                while True:  # 全局 UNIQUE(code)，撞码（极小概率）则重取
+                    pcode = new_code(10)
+                    if conn.execute(
+                        "SELECT 1 FROM assignments WHERE code = ?", (pcode,)
+                    ).fetchone() is None:
+                        break
+                conn.execute(
+                    """INSERT INTO assignments
+                       (test_id, panelist, code, odd_pos, odd_sample, status)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (row["id"], name, pcode, odd_pos, odd_sample, ACTIVE),
+                )
+                added.append({
+                    "panelist": name,
+                    "code": pcode,
+                    "url": f"/eval/code/{pcode}",
+                })
+
+        active_rows = conn.execute(
+            "SELECT answer FROM assignments WHERE test_id = ? AND status = ?",
+            (row["id"], ACTIVE),
+        ).fetchall()
+
+    submitted = sum(1 for a in active_rows if a["answer"] is not None)
+    abstained = sum(1 for a in active_rows if a["answer"] == ABSTAIN)
+    valid_answers = sum(
+        1 for a in active_rows if a["answer"] not in (None, ABSTAIN)
+    )
+    return {
+        "ok": True,
+        "test_code": row["code"],
+        "withdrawn": [
+            {"panelist": a["panelist"], "code": a["code"]}
+            for a in withdrawn_rows
+        ],
+        "added": added,
+        "progress": {
+            "total": len(active_rows),
+            "submitted": submitted,
+            "abstained": abstained,
+            "valid": valid_answers,
+        },
     }
 
 

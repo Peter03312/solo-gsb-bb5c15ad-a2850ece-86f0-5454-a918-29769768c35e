@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS assignments (
     odd_sample   TEXT NOT NULL,                       -- 异样杯样本编号（A 或 B）
     answer       INTEGER,                             -- 1/2/3；弃权为 -1；未提交 NULL
     answered_at  INTEGER,
+    status       TEXT NOT NULL DEFAULT 'active',      -- active 有效名单；withdrawn 已撤回
     UNIQUE(test_id, panelist)
 );
 
@@ -56,6 +57,13 @@ def init_db():
     conn = connect()
     try:
         conn.executescript(_SCHEMA)
+        # 兼容旧库：为已存在的 assignments 表补 status 列
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(assignments)")}
+        if "status" not in cols:
+            conn.execute(
+                "ALTER TABLE assignments ADD COLUMN status TEXT NOT NULL "
+                "DEFAULT 'active'"
+            )
         conn.commit()
     finally:
         conn.close()

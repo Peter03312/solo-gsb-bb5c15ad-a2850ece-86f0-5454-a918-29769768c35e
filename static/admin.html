@@ -56,6 +56,7 @@ function render(t) {
         <div class="stat"><div class="num">${t.progress.total}</div><div class="cap">评员总数</div></div>
         <div class="stat"><div class="num">${t.progress.submitted}</div><div class="cap">已提交(含弃权)</div></div>
         <div class="stat"><div class="num">${t.progress.valid}</div><div class="cap">有效答卷</div></div>
+        <div class="stat"><div class="num">${t.withdrawn_count || 0}</div><div class="cap">已撤回</div></div>
       </div>
       <p class="hint">截止前仅显示汇总计数，不显示任何评员的答案与三杯对应关系，以防泄露。</p>
       <button id="settleBtn" ${(!past || t.settled) ? 'disabled' : ''}>
@@ -63,6 +64,30 @@ function render(t) {
       </button>
       <div id="settleMsg"></div>
       <div id="report"></div>
+    </div>
+
+    <div class="card">
+      <h2>名单调整（截止前 · 缺席处理）</h2>
+      <p class="hint">
+        可只补位、只撤回，或一次操作同时撤回并补位。仅<b>未提交</b>者可撤回；
+        已作答或已弃权者不可撤回，撤回后的旧码立即失效。补位评员取得新专属码，
+        同一实验姓名不得重用；已有评员的杯序、异样样本与答卷不变，
+        新分配会尽量均衡异样杯位置与异样样本。
+        调整后有效人数须在 <b>${t.min_valid}</b> ～ <b>500</b> 人之间，
+        任一校验失败则整次操作无效。
+      </p>
+      ${(past || t.settled) ? `
+        <div class="callout ${t.settled ? 'no' : 'warn'}">
+          ${t.settled ? '测试已结算，名单已冻结，不能调整。' : '已过截止时间，不能调整名单。'}
+        </div>` : `
+        <label>要撤回的盲评码（每行一个；可留空表示只补位）</label>
+        <textarea id="withdrawCodes" rows="3"
+          placeholder="贴入缺席评员的盲评码，每行一个"></textarea>
+        <label>补位评员姓名（每行一个；可留空表示只撤回）</label>
+        <textarea id="addPanelists" rows="3"
+          placeholder="新评员姓名，每行一个"></textarea>
+        <button id="adjustBtn">执行调整</button>
+        <div id="adjustMsg"></div>`}
     </div>
 
     <div class="card">
@@ -93,7 +118,47 @@ function render(t) {
   }, 1000);
 
   document.getElementById('settleBtn').addEventListener('click', doSettle);
+  const adjustBtn = document.getElementById('adjustBtn');
+  if (adjustBtn) adjustBtn.addEventListener('click', doAdjust);
   if (t.settled) doSettle();
+}
+
+async function doAdjust() {
+  const msgEl = document.getElementById('adjustMsg');
+  const wCodes = document.getElementById('withdrawCodes').value.split('\n')
+    .map(s => s.trim()).filter(Boolean);
+  const aNames = document.getElementById('addPanelists').value.split('\n')
+    .map(s => s.trim()).filter(Boolean);
+  if (wCodes.length === 0 && aNames.length === 0) {
+    showErr(msgEl, '请至少填写要撤回的盲评码或补位评员姓名。');
+    return;
+  }
+  const word = (wCodes.length && aNames.length)
+    ? `撤回 ${wCodes.length} 人并补位 ${aNames.length} 人`
+    : wCodes.length ? `撤回 ${wCodes.length} 人`
+    : `补位 ${aNames.length} 人`;
+  if (!confirm(`确认${word}？任一校验失败将整次无效（不产生任何改动）。`)) return;
+
+  const btn = document.getElementById('adjustBtn');
+  btn.disabled = true; btn.textContent = '调整中…';
+  try {
+    const r = await api(`/api/tests/${encodeURIComponent(code)}/adjust`, {
+      method: 'POST',
+      body: { token, withdraw_codes: wCodes, add_panelists: aNames },
+    });
+    const lines = [];
+    if (r.withdrawn.length)
+      lines.push(`已撤回：${r.withdrawn.map(x => esc(x.panelist)).join('、')}（旧码已立即失效）`);
+    if (r.added.length)
+      lines.push(`已补位：${r.added.map(x => esc(x.panelist)).join('、')}` +
+        `（新盲评码见下方分发名单）`);
+    lines.push(`当前有效名单 ${r.progress.total} 人。`);
+    showInfo(msgEl, lines.join(' '), 'ok');
+    setTimeout(load, 1200);  // 刷新以展示新分发码与计数
+  } catch (err) {
+    showErr(msgEl, err.message);
+    btn.disabled = false; btn.textContent = '执行调整';
+  }
 }
 
 async function doSettle() {
