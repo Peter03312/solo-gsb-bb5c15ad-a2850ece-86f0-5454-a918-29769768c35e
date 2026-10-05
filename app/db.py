@@ -36,11 +36,17 @@ CREATE TABLE IF NOT EXISTS assignments (
     odd_sample   TEXT NOT NULL,                       -- 异样杯样本编号（A 或 B）
     answer       INTEGER,                             -- 1/2/3；弃权为 -1；未提交 NULL
     answered_at  INTEGER,
+    withdrawn_at INTEGER,                             -- 撤回时刻；非 NULL 即退出有效名单（旧码作废）
     UNIQUE(test_id, panelist)
 );
 
 CREATE INDEX IF NOT EXISTS idx_assignments_test ON assignments(test_id);
 """
+
+# 旧库升级语句（列已存在时跳过）
+_MIGRATIONS = (
+    "ALTER TABLE assignments ADD COLUMN withdrawn_at INTEGER",
+)
 
 
 def connect():
@@ -56,6 +62,14 @@ def init_db():
     conn = connect()
     try:
         conn.executescript(_SCHEMA)
+        cols = {
+            r["name"]
+            for r in conn.execute("PRAGMA table_info(assignments)").fetchall()
+        }
+        for stmt in _MIGRATIONS:
+            col = stmt.split("ADD COLUMN", 1)[1].strip().split()[0]
+            if col not in cols:
+                conn.execute(stmt)
         conn.commit()
     finally:
         conn.close()

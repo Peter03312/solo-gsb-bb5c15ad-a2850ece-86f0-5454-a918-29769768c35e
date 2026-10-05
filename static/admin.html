@@ -66,6 +66,27 @@ function render(t) {
     </div>
 
     <div class="card">
+      <h2>评员缺席处理（撤回 / 补位）</h2>
+      ${(past || t.settled) ? `
+        <div class="callout ${t.settled ? 'ok' : 'warn'}">
+          ${t.settled ? '测试已结算，名单已冻结，不能再调整。' : '已过截止时间，不能再调整名单。'}
+        </div>` : `
+      <p class="hint">截止前负责人可凭管理凭证处理缺席：仅<b>未提交</b>者可撤回
+        （已作答 / 弃权者不可撤回）；撤回后旧码立即失效。补位评员取得新专属码，
+        姓名在本实验中不可与任何人（含已撤回者）重复；新分配在约束下尽量保持
+        异样杯位置与异样样本均衡。调整后有效人数须 ≥ ${t.min_valid} 且 ≤ 500；
+        任一校验失败则整次操作不生效。</p>
+      <form id="adjustForm">
+        <label>要撤回的盲评码（每行一个，可留空表示只补位）</label>
+        <textarea id="withdrawCodes" rows="2" placeholder="ABC23xyz9K"></textarea>
+        <label>补位评员姓名（每行一个，可留空表示只撤回）</label>
+        <textarea id="replaceNames" rows="2" placeholder="赵六"></textarea>
+        <button type="submit">执行撤回 / 补位</button>
+      </form>
+      <div id="adjustMsg"></div>`}
+    </div>
+
+    <div class="card">
       <h2>盲评码分发名单（仅负责人可见）</h2>
       <p class="hint">请将每人的专属链接单独发给本人；盲评码不可重复使用。</p>
       <table>
@@ -93,7 +114,53 @@ function render(t) {
   }, 1000);
 
   document.getElementById('settleBtn').addEventListener('click', doSettle);
+  const adjustForm = document.getElementById('adjustForm');
+  if (adjustForm) adjustForm.addEventListener('submit', doAdjust);
   if (t.settled) doSettle();
+}
+
+async function doAdjust(e) {
+  e.preventDefault();
+  const msgEl = document.getElementById('adjustMsg');
+  const codes = document.getElementById('withdrawCodes').value
+    .split('\n').map(s => s.trim()).filter(Boolean);
+  const names = document.getElementById('replaceNames').value
+    .split('\n').map(s => s.trim()).filter(Boolean);
+  if (!codes.length && !names.length) {
+    return showErr(msgEl, '请至少填写一个要撤回的盲评码或一个补位姓名');
+  }
+  if (!confirm(
+      `确认执行：撤回 ${codes.length} 个盲评码、新增 ${names.length} 名补位评员？\n` +
+      '任一校验失败将整次取消，不会部分生效。')) return;
+
+  const btn = e.target.querySelector('button');
+  btn.disabled = true; btn.textContent = '处理中…';
+  try {
+    const r = await api(`/api/tests/${encodeURIComponent(code)}/adjust`, {
+      method: 'POST',
+      body: { token, withdraw_codes: codes, replacements: names },
+    });
+    const lines = [];
+    (r.withdrawn || []).forEach(w => lines.push(
+      `已撤回：${esc(w.panelist)}（旧码 <span class="code">${esc(w.code)}</span> 已失效）`));
+    (r.added || []).forEach(a => lines.push(
+      `已补位：${esc(a.panelist)}，新盲评码 <span class="code">${esc(a.code)}</span>
+       <a href="${esc(a.url)}" target="_blank" class="small">打开</a>`));
+    const b = r.balance || {};
+    msgEl.innerHTML = `<div class="callout ok">
+      操作成功，当前有效名单 <b>${r.progress.total}</b> 人。<br>${lines.join('<br>')}
+      <br><span class="small">均衡：异样杯位置
+      ${esc(JSON.stringify(b.odd_pos_counts))}，异样样本
+      ${esc(JSON.stringify(b.odd_sample_counts))}</span></div>`;
+    document.getElementById('withdrawCodes').value = '';
+    document.getElementById('replaceNames').value = '';
+    load();  // 刷新进度与分发名单
+  } catch (err) {
+    showErr(msgEl, err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '执行撤回 / 补位';
+  }
 }
 
 async function doSettle() {

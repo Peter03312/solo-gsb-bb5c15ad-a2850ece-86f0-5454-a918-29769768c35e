@@ -19,7 +19,7 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from . import db
 from .stats import binomial_tail
@@ -88,6 +88,23 @@ def assign_cups(n: int):
     return result
 
 
+def pick_least(counts: dict, keys):
+    """选择当前计数最少的桶（位置/样本），并列时随机以保证不可预测。"""
+    least = min(counts[k] for k in keys)
+    return secrets.choice([k for k in keys if counts[k] == least])
+
+
+def new_assignment_code(conn) -> str:
+    """生成库内不冲突的评员盲评码（UNIQUE 兜底，循环重试）。"""
+    for _ in range(5):
+        candidate = new_code(10)
+        if conn.execute(
+            "SELECT 1 FROM assignments WHERE code = ?", (candidate,)
+        ).fetchone() is None:
+            return candidate
+    raise HTTPException(status_code=500, detail="盲评码生成冲突，请稍后重试")
+
+
 def assignment_public(a) -> dict:
     """评员可见：截止/结算前绝不暴露异样杯对应关系。"""
     return {
@@ -135,6 +152,28 @@ class AdminAction(BaseModel):
 class SubmitAnswer(BaseModel):
     answer: Optional[int] = Field(default=None, ge=1, le=3)
     abstain: bool = False
+
+
+class AdjustRoster(BaseModel):
+    """截止前调整名单：撤回缺席者盲评码并/或为补位评员发新码。
+
+    两列表均可选：只给补位姓名即只补位；两者都给即在一次原子操作中
+    先撤回再补位。任一字段兼容多种命名，保持接口稳定。
+    """
+
+    token: str
+    withdraw_codes: Optional[List[str]] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "withdraw_codes", "withdraw", "withdrawn_codes",
+            "revoke_codes", "codes"),
+    )
+    replacements: Optional[List[str]] = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "replacements", "replacement_names", "add_panelists",
+            "new_panelists", "panelists"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +262,7 @@ def get_test(test_code: str, token: str):
     try:
         assigns = conn.execute(
             "SELECT panelist, code, answer, answered_at FROM assignments "
-            "WHERE test_id = ? ORDER BY id",
+            "WHERE test_id = ? AND withdrawn_at IS NULL ORDER BY id",
             (row["id"],),
         ).fetchall()
     finally:
@@ -265,13 +304,13 @@ def get_assignment(code: str):
         a = conn.execute(
             "SELECT a.*, t.deadline, t.settled_at, t.sample_a, t.sample_b "
             "FROM assignments a JOIN tests t ON a.test_id = t.id "
-            "WHERE a.code = ?",
+            "WHERE a.code = ? AND a.withdrawn_at IS NULL",
             (code,),
         ).fetchone()
     finally:
         conn.close()
     if a is None:
-        raise HTTPException(status_code=404, detail="盲评码无效")
+        raise HTTPException(status_code=404, detail="盲评码无效或已撤回")
 
     ts = now_ts()
     past_deadline = ts >= a["deadline"]
@@ -307,11 +346,12 @@ def submit(code: str, body: SubmitAnswer):
     with db.write_tx() as conn:
         a = conn.execute(
             "SELECT a.*, t.deadline FROM assignments a "
-            "JOIN tests t ON a.test_id = t.id WHERE a.code = ?",
+            "JOIN tests t ON a.test_id = t.id "
+            "WHERE a.code = ? AND a.withdrawn_at IS NULL",
             (code,),
         ).fetchone()
         if a is None:
-            raise HTTPException(status_code=404, detail="盲评码无效")
+            raise HTTPException(status_code=404, detail="盲评码无效或已撤回")
         if a["answer"] is not None:
             raise HTTPException(status_code=409, detail="该盲评码已提交，答卷不可修改")
         if now_ts() >= a["deadline"]:
@@ -344,7 +384,8 @@ def settle(test_code: str, body: AdminAction):
             frozen = row
         else:
             assigns = conn.execute(
-                "SELECT * FROM assignments WHERE test_id = ?", (row["id"],)
+                "SELECT * FROM assignments WHERE test_id = ? "
+                "AND withdrawn_at IS NULL", (row["id"],)
             ).fetchall()
             valid = sum(1 for a in assigns if a["answer"] not in (None, ABSTAIN))
             correct = sum(
@@ -363,7 +404,8 @@ def settle(test_code: str, body: AdminAction):
             ).fetchone()
 
         assigns = conn.execute(
-            "SELECT * FROM assignments WHERE test_id = ? ORDER BY id", (row["id"],)
+            "SELECT * FROM assignments WHERE test_id = ? AND withdrawn_at IS NULL "
+            "ORDER BY id", (row["id"],)
         ).fetchall()
 
     if frozen["valid_count"] < frozen["min_valid"]:
@@ -401,10 +443,170 @@ def settle(test_code: str, body: AdminAction):
     }
 
 
+@app.post("/api/tests/{test_code}/adjust")
+def adjust_roster(test_code: str, body: AdjustRoster):
+    """截止前处理评员缺席：撤回未提交者的盲评码并/或新增补位评员。
+
+    - 整个操作在一个 BEGIN IMMEDIATE 写事务中完成，任一校验失败则整体回滚；
+      与答卷提交互斥，按实际先拿到写锁（先完成）的操作判定。
+    - 仅未提交（answer IS NULL）者可撤回；已作答或弃权者不可撤回。
+    - 撤回后旧码立即作废（查看/提交均 404）；补位者取得新的专属码。
+    - 同一实验内姓名（含已撤回者）不得重用；补位分配使调整后有效名单的
+      异样杯位置（1/2/3）与异样样本（A/B）计数尽量均衡。
+    - 调整后有效人数须满足 min_valid ≤ 人数 ≤ 500。
+    - 截止或结算后一律拒绝；结算前返回中不包含任何个人答案/样本对应关系。
+    """
+    # 输入规整：去空白、去重、保序；两列表均可省略
+    withdraw_codes = []
+    seen_codes = set()
+    for raw in body.withdraw_codes or []:
+        c = (raw or "").strip()
+        if c and c not in seen_codes:
+            seen_codes.add(c)
+            withdraw_codes.append(c)
+
+    names = []
+    seen_names = set()
+    for raw in body.replacements or []:
+        name = (raw or "").strip()
+        if name and name not in seen_names:
+            seen_names.add(name)
+            names.append(name)
+
+    if not withdraw_codes and not names:
+        raise HTTPException(
+            status_code=422,
+            detail="请至少提供一个要撤回的盲评码或一个补位评员姓名")
+
+    ts = now_ts()
+    added = []
+    withdrawn = []
+
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        if row["settled_at"] is not None:
+            raise HTTPException(status_code=409, detail="测试已结算，名单冻结不可调整")
+        if ts >= row["deadline"]:
+            raise HTTPException(status_code=403, detail="已过截止时间，不能调整名单")
+
+        assigns = conn.execute(
+            "SELECT * FROM assignments WHERE test_id = ?", (row["id"],)
+        ).fetchall()
+        by_code = {a["code"]: a for a in assigns}
+        active = [a for a in assigns if a["withdrawn_at"] is None]
+        all_names = {a["panelist"] for a in assigns}  # 含已撤回者，姓名永不可重用
+
+        # --- 撤回校验：码必须属于本测试、当前仍有效、且尚未提交 ---
+        for c in withdraw_codes:
+            a = by_code.get(c)
+            if a is None or a["withdrawn_at"] is not None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"盲评码 {c} 无效或已撤回，无法撤回")
+            if a["answer"] is not None:
+                state = "已弃权" if a["answer"] == ABSTAIN else "已作答"
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"评员 {a['panelist']}（盲评码 {c}）{state}，不可撤回")
+
+        # --- 补位姓名校验 ---
+        for name in names:
+            if name in all_names:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"姓名 {name} 在本实验中已存在（含已撤回者），不得重用")
+
+        new_total = len(active) - len(withdraw_codes) + len(names)
+        if new_total < row["min_valid"]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"调整后有效人数为 {new_total}，少于最少有效答卷数 "
+                       f"{row['min_valid']}，操作无效")
+        if new_total > 500:
+            raise HTTPException(
+                status_code=422,
+                detail=f"调整后有效人数为 {new_total}，超过 500 人上限，操作无效")
+
+        # --- 执行撤回：旧码立即作废（行保留作审计，退出有效名单） ---
+        for c in withdraw_codes:
+            conn.execute(
+                "UPDATE assignments SET withdrawn_at=? WHERE id=?",
+                (ts, by_code[c]["id"]),
+            )
+            withdrawn.append({"panelist": by_code[c]["panelist"], "code": c})
+
+        # --- 执行补位：在“撤回后剩余名单”的计数上贪心补缺，两维各自尽量均衡 ---
+        remaining = [
+            a for a in assigns
+            if a["withdrawn_at"] is None and a["code"] not in seen_codes
+        ]
+        pos_counts = {p: 0 for p in (1, 2, 3)}
+        sample_counts = {s: 0 for s in ("A", "B")}
+        for a in remaining:
+            pos_counts[a["odd_pos"]] += 1
+            sample_counts[a["odd_sample"]] += 1
+
+        for name in names:
+            odd_pos = pick_least(pos_counts, (1, 2, 3))
+            odd_sample = pick_least(sample_counts, ("A", "B"))
+            pos_counts[odd_pos] += 1
+            sample_counts[odd_sample] += 1
+            code = new_assignment_code(conn)
+            conn.execute(
+                """INSERT INTO assignments
+                   (test_id, panelist, code, odd_pos, odd_sample)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (row["id"], name, code, odd_pos, odd_sample),
+            )
+            added.append({"panelist": name, "code": code, "url": f"/eval/code/{code}"})
+
+        # --- 以最终有效名单重新汇总 ---
+        final_rows = conn.execute(
+            "SELECT * FROM assignments WHERE test_id = ? AND withdrawn_at IS NULL "
+            "ORDER BY id",
+            (row["id"],),
+        ).fetchall()
+
+    submitted = sum(1 for a in final_rows if a["answer"] is not None)
+    abstained = sum(1 for a in final_rows if a["answer"] == ABSTAIN)
+    valid = sum(1 for a in final_rows if a["answer"] not in (None, ABSTAIN))
+
+    return {
+        "ok": True,
+        "test_code": row["code"],
+        "adjusted_at": ts * 1000,
+        "deadline": row["deadline"] * 1000,
+        "settled": False,
+        "withdrawn": withdrawn,
+        "added": added,
+        "progress": {
+            "total": len(final_rows),
+            "submitted": submitted,
+            "abstained": abstained,
+            "valid": valid,
+        },
+        "balance": {
+            "odd_pos_counts": {
+                str(p): sum(1 for a in final_rows if a["odd_pos"] == p)
+                for p in (1, 2, 3)
+            },
+            "odd_sample_counts": {
+                s: sum(1 for a in final_rows if a["odd_sample"] == s)
+                for s in ("A", "B")
+            },
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # 前端
 # ---------------------------------------------------------------------------
-
 @app.get("/")
 def index():
     return FileResponse(f"{STATIC_DIR}/index.html")

@@ -20,6 +20,22 @@
      否则明确说明“样本不足（有效答卷少于最低要求）”或“证据未达阈值（p > 0.05）”。
 6. 结果冻结后可回看每位评员的异样杯位置、异样样本、提交答案与对错；
    重复结算返回同一份冻结结果。
+7. **截止前处理评员缺席（撤回 / 补位）**：凭原有管理凭证（测试码 + 令牌）提交
+   要撤回的盲评码与补位评员姓名，两者都可省略——只给姓名即**只补位**，两者都给
+   即在**一次原子操作**中先撤回再补位（也可只给盲评码做纯撤回）。规则：
+   - **仅未提交者可撤回**；已作答或已弃权者不可撤回；撤回后旧码立即失效，
+     既不能查看也不能提交（统一 404）。
+   - 补位评员取得**新的专属高熵盲评码**；同一实验内姓名不得与任何评员重用
+     （**包括已撤回者**）；其余在席评员的杯序、异样样本与答卷完全不变。
+   - 新分配在此约束下使调整后**有效名单**的异样杯位置（1/2/3）与异样样本（A/B）
+     计数尽量均衡（贪心补缺，最大差值 ≤ 1）。
+   - 调整后有效人数必须满足 **最低有效答卷数 ≤ 有效人数 ≤ 500**；
+     **任一校验失败整次操作回滚、不部分生效**。
+   - 调整与答卷并发时在同一 `BEGIN IMMEDIATE` 写事务上竞争，**按实际先完成的
+     操作判定**；**截止后或已结算一律拒绝调整**（结算即冻结）。
+   - 负责人进度、结算与回看都只统计**有效名单**（撤回者不计入总数/弃权/未交）；
+     结算前调整接口同样不披露任何个人答案或杯号/样本对应关系，仅返回
+     位置/样本的**汇总计数**供核对均衡。
 
 **评员**
 
@@ -27,9 +43,10 @@
 - **提交后不可修改、不能再次提交**；截止后服务端拒绝一切答卷；
 - 结算前任何页面都看不到样本对应关系；结算后可在本人页面回看自己的分配与对错。
 
-**并发规则**：答卷与结算都在 SQLite `BEGIN IMMEDIATE` 写事务中完成，
-截止判定一律以**服务端时钟**为准——临界时刻要么答卷落入截止前、要么按截止后拒绝，
-结算一旦写入即冻结，不会被后续操作改动。
+**并发规则**：答卷、撤回/补位与结算都在 SQLite `BEGIN IMMEDIATE` 写事务中完成，
+截止判定一律以**服务端时钟**为准——临界时刻要么答卷落入截止前、要么按截止后拒绝；
+答卷与名单调整竞争同一评员时按**实际先完成（先取得写锁）的操作判定**，
+不会出现“既提交又撤回”的双生效；结算一旦写入即冻结，不会被后续操作改动。
 
 ## 一键启动（Docker Compose，推荐）
 
@@ -89,7 +106,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 ## 测试
 
 测试仅依赖 Python 标准库，会启动真实 uvicorn 子进程走完整 HTTP 流程
-（统计函数交叉验证、输入校验、盲态保密、一次提交、截止拒答、结算判定、冻结、回看）：
+（统计函数交叉验证、输入校验、盲态保密、一次提交、截止拒答、结算判定、冻结、回看、
+撤回/补位的全部校验、旧码失效、均衡补缺、名单统计口径与并发互斥）：
 
 ```bash
 pip install -r requirements.txt
@@ -101,11 +119,84 @@ python tests/smoke_test.py
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/tests` | 创建测试，返回测试码与负责人令牌（令牌仅返回一次） |
-| GET  | `/api/tests/{code}?token=` | 负责人进度（截止前仅汇总计数 + 分发链接） |
+| GET  | `/api/tests/{code}?token=` | 负责人进度（截止前仅汇总计数 + 分发链接，仅含有效名单） |
 | POST | `/api/tests/{code}/settle` | 截止后结算（重复调用返回冻结结果） |
-| GET  | `/api/eval/{code}` | 评员视图（结算前无任何分配/样本信息） |
-| POST | `/api/eval/{code}/submit` | 提交 `{"answer":1|2|3}` 或 `{"abstain":true}` |
+| POST | `/api/tests/{code}/adjust` | **截止前撤回缺席者盲评码并/或补位（原子操作）** |
+| GET  | `/api/eval/{code}` | 评员视图（结算前无任何分配/样本信息；撤回码 404） |
+| POST | `/api/eval/{code}/submit` | 提交 `{"answer":1|2|3}` 或 `{"abstain":true}`（撤回码 404） |
 | GET  | `/api/time` | 服务端当前时间（毫秒） |
+
+### 撤回 / 补位接口调用示例
+
+`POST /api/tests/{test_code}/adjust`，请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `token` | string | 创建时发放的负责人令牌（必填） |
+| `withdraw_codes` | string[] | 要撤回的盲评码；省略/空数组表示不撤回（别名：`withdraw` / `withdrawn_codes` / `revoke_codes` / `codes`） |
+| `replacements` | string[] | 补位评员姓名（自动去空白/去重）；省略/空数组表示只撤回（别名：`replacement_names` / `add_panelists` / `new_panelists` / `panelists`） |
+
+**一次操作中撤回并补位**（推荐，原子完成）：
+
+```bash
+curl -X POST http://localhost:8080/api/tests/AbC123Xy/adjust \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "token": "t8Kp...（创建时发放，仅显示一次）",
+    "withdraw_codes": ["VJmMDcEkYt"],
+    "replacements": ["陈甲", "陈乙"]
+  }'
+```
+
+返回（结算前不含任何个人杯号/样本对应；`balance` 仅为汇总计数）：
+
+```json
+{
+  "ok": true,
+  "test_code": "AbC123Xy",
+  "adjusted_at": 1791187071000,
+  "deadline": 1791190671000,
+  "settled": false,
+  "withdrawn": [{"panelist": "王五", "code": "VJmMDcEkYt"}],
+  "added": [
+    {"panelist": "陈甲", "code": "cmynUFxDhH", "url": "/eval/code/cmynUFxDhH"},
+    {"panelist": "陈乙", "code": "DNyV2Bk3aF", "url": "/eval/code/DNyV2Bk3aF"}
+  ],
+  "progress": {"total": 10, "submitted": 2, "abstained": 1, "valid": 1},
+  "balance": {
+    "odd_pos_counts": {"1": 3, "2": 3, "3": 4},
+    "odd_sample_counts": {"A": 5, "B": 5}
+  }
+}
+```
+
+**只补位**（不撤回，名单扩容，仍受 500 人上限约束）：
+
+```bash
+curl -X POST http://localhost:8080/api/tests/AbC123Xy/adjust \
+  -H 'Content-Type: application/json' \
+  -d '{"token": "t8Kp...", "replacements": ["陈甲"]}'
+```
+
+**只撤回**（不补位，调整后人数仍须 ≥ 最低有效答卷数）：
+
+```bash
+curl -X POST http://localhost:8080/api/tests/AbC123Xy/adjust \
+  -H 'Content-Type: application/json' \
+  -d '{"token": "t8Kp...", "withdraw_codes": ["VJmMDcEkYt"]}'
+```
+
+错误均为整次操作无效、数据不变，常见状态码：
+
+| 状态码 | 场景 |
+| --- | --- |
+| 403 | 管理令牌错误；已过截止时间 |
+| 404 | 测试不存在；盲评码无效 / 已撤回 |
+| 409 | 目标评员已作答或已弃权不可撤回；测试已结算（冻结） |
+| 422 | 空操作；姓名重用；调整后有效人数低于最低有效数或超过 500 |
+
+管理台（`/admin?test=...&token=...`）在截止前会显示「评员缺席处理（撤回 / 补位）」
+卡片，可直接粘贴盲评码与姓名操作；截止后或结算后卡片自动锁定。
 
 ## 安全与使用注意
 
